@@ -57,6 +57,49 @@ func TestParseICalendarUTCAndTZID(t *testing.T) {
 	}
 }
 
+func TestParseICalendarRecurringEvent(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, 8, 27, 10, 0, 0, 0, location)
+	ics := "BEGIN:VCALENDAR\n" +
+		"BEGIN:VEVENT\nUID:daily\nSUMMARY:Daily stand-up\nDTSTART:20260825T093000\nRRULE:FREQ=DAILY;COUNT=5\nEND:VEVENT\n" +
+		"END:VCALENDAR\n"
+
+	events, err := parseICalendar(ics, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Event{{
+		UID: "daily::20260827T013000Z", Title: "Daily stand-up",
+		DueDate: "2026-08-27", DueTime: "09:30",
+	}}
+	if len(events) != len(want) || events[0] != want[0] {
+		t.Fatalf("got %#v, want %#v", events, want)
+	}
+}
+
+func TestParseICalendarRecurringExceptions(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, 8, 27, 10, 0, 0, 0, location)
+	ics := "BEGIN:VCALENDAR\n" +
+		"BEGIN:VEVENT\nUID:moved\nSUMMARY:Original\nDTSTART:20260825T090000\nRRULE:FREQ=DAILY;COUNT=5\nEXDATE:20260826T090000\nEND:VEVENT\n" +
+		"BEGIN:VEVENT\nUID:moved\nRECURRENCE-ID:20260827T090000\nSUMMARY:Moved instance\nDTSTART:20260827T140000\nEND:VEVENT\n" +
+		"BEGIN:VEVENT\nUID:cancelled-series\nSUMMARY:Cancelable\nDTSTART:20260825T110000\nRRULE:FREQ=DAILY;COUNT=5\nEND:VEVENT\n" +
+		"BEGIN:VEVENT\nUID:cancelled-series\nRECURRENCE-ID:20260827T110000\nSUMMARY:Cancelable\nDTSTART:20260827T110000\nSTATUS:CANCELLED\nEND:VEVENT\n" +
+		"END:VCALENDAR\n"
+
+	events, err := parseICalendar(ics, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Event{
+		UID: "moved::20260827T010000Z", Title: "Moved instance",
+		DueDate: "2026-08-27", DueTime: "14:00",
+	}
+	if len(events) != 1 || events[0] != want {
+		t.Fatalf("got %#v, want %#v", events, []Event{want})
+	}
+}
+
 func TestGoogleCalendarFeedURL(t *testing.T) {
 	got, err := googleCalendarFeedURL("webcal://calendar.google.com/calendar/ical/example/basic.ics")
 	if err != nil {

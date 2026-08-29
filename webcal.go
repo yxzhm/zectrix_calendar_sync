@@ -6,8 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/teambition/rrule-go"
 )
 
 type Event struct {
@@ -154,45 +157,199 @@ func parseICalTime(property icalProperty, local *time.Location) (time.Time, erro
 	return time.Time{}, fmt.Errorf("unsupported DTSTART %q", value)
 }
 
-func parseICalendar(data string, now time.Time) ([]Event, error) {
-	var events []Event
-	inEvent := false
-	properties := make(map[string]icalProperty)
-	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	endOfDay := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+type icalEvent struct {
+	properties map[string][]icalProperty
+}
+
+func (event icalEvent) first(name string) icalProperty {
+	properties := event.properties[name]
+	if len(properties) == 0 {
+		return icalProperty{}
+	}
+	return properties[0]
+}
+
+func parseICalEvents(data string) []icalEvent {
+	var events []icalEvent
+	var current *icalEvent
 	for _, line := range unfoldICal(data) {
 		switch strings.ToUpper(line) {
 		case "BEGIN:VEVENT":
-			inEvent = true
-			properties = make(map[string]icalProperty)
-			continue
+			current = &icalEvent{properties: make(map[string][]icalProperty)}
 		case "END:VEVENT":
-			if !inEvent {
+			if current != nil {
+				events = append(events, *current)
+				current = nil
+			}
+		default:
+			if current == nil {
 				continue
 			}
-			inEvent = false
-			summary := strings.TrimSpace(unescapeICalText(properties["SUMMARY"].Value))
-			uid := strings.TrimSpace(properties["UID"].Value)
-			status := strings.ToUpper(strings.TrimSpace(properties["STATUS"].Value))
-			if summary == "" || properties["DTSTART"].Name == "" || status == "CANCELLED" || strings.Contains(summary, "已取消") || strings.Contains(strings.ToLower(summary), "cancelled") || strings.Contains(strings.ToLower(summary), "canceled") {
-				continue
+			if property, ok := parseICalProperty(line); ok {
+				current.properties[property.Name] = append(current.properties[property.Name], property)
 			}
-			start, err := parseICalTime(properties["DTSTART"], now.Location())
+		}
+	}
+	return events
+}
+
+func parseICalTimes(properties []icalProperty, local *time.Location) ([]time.Time, error) {
+	var result []time.Time
+	for _, property := range properties {
+		for _, value := range strings.Split(property.Value, ",") {
+			// An RDATE can be a PERIOD; its first value is the occurrence start.
+			value, _, _ = strings.Cut(value, "/")
+			item := property
+			item.Value = value
+			parsed, err := parseICalTime(item, local)
 			if err != nil {
 				return nil, err
 			}
-			if start.Before(startOfDay) || !start.Before(endOfDay) {
-				continue
-			}
-			events = append(events, Event{UID: uid, Title: summary, DueDate: start.Format("2006-01-02"), DueTime: start.Format("15:04")})
-			continue
-		}
-		if !inEvent {
-			continue
-		}
-		if property, ok := parseICalProperty(line); ok {
-			properties[property.Name] = property
+			result = append(result, parsed)
 		}
 	}
+	return result, nil
+}
+
+func recurrenceKey(value time.Time) string {
+	return value.UTC().Format("20060102T150405Z")
+}
+
+func recurringUID(uid string, recurrenceID time.Time) string {
+	return uid + "::" + recurrenceKey(recurrenceID)
+}
+
+func eventDetails(event icalEvent) (uid, summary, status string) {
+	uid = strings.TrimSpace(event.first("UID").Value)
+	summary = strings.TrimSpace(unescapeICalText(event.first("SUMMARY").Value))
+	status = strings.ToUpper(strings.TrimSpace(event.first("STATUS").Value))
+	return
+}
+
+func isUsableEvent(summary, status string, start icalProperty) bool {
+	lowerSummary := strings.ToLower(summary)
+	isAllDay := strings.EqualFold(start.Params["VALUE"], "DATE") || (len(start.Value) == 8 && !strings.Contains(start.Value, "T"))
+	return summary != "" && start.Name != "" && !isAllDay && status != "CANCELLED" &&
+		!strings.Contains(summary, "已取消") &&
+		!strings.Contains(lowerSummary, "cancelled") &&
+		!strings.Contains(lowerSummary, "canceled")
+}
+
+func appendEventForDay(events []Event, seen map[string]struct{}, uid, summary string, start, startOfDay, endOfDay time.Time) []Event {
+	if start.Before(startOfDay) || !start.Before(endOfDay) {
+		return events
+	}
+	if _, exists := seen[uid]; exists {
+		return events
+	}
+	seen[uid] = struct{}{}
+	return append(events, Event{UID: uid, Title: summary, DueDate: start.Format("2006-01-02"), DueTime: start.Format("15:04")})
+}
+
+func parseICalendar(data string, now time.Time) ([]Event, error) {
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	endOfDay := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	components := parseICalEvents(data)
+
+	// Changed and cancelled instances are separate VEVENTs. Index them first so
+	// they can replace the matching occurrence generated from the series master.
+	overrides := make(map[string]icalEvent)
+	for _, component := range components {
+		recurrenceID := component.first("RECURRENCE-ID")
+		if recurrenceID.Name == "" {
+			continue
+		}
+		parsed, err := parseICalTime(recurrenceID, now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("parse RECURRENCE-ID: %w", err)
+		}
+		uid, _, _ := eventDetails(component)
+		overrides[uid+"\x00"+recurrenceKey(parsed)] = component
+	}
+
+	var events []Event
+	seen := make(map[string]struct{})
+	for _, component := range components {
+		uid, summary, status := eventDetails(component)
+		if uid == "" {
+			continue
+		}
+		startProperty := component.first("DTSTART")
+		recurrenceIDProperty := component.first("RECURRENCE-ID")
+		if recurrenceIDProperty.Name != "" {
+			recurrenceID, err := parseICalTime(recurrenceIDProperty, now.Location())
+			if err != nil {
+				return nil, fmt.Errorf("parse RECURRENCE-ID: %w", err)
+			}
+			if !isUsableEvent(summary, status, startProperty) {
+				continue
+			}
+			start, err := parseICalTime(startProperty, now.Location())
+			if err != nil {
+				return nil, err
+			}
+			events = appendEventForDay(events, seen, recurringUID(uid, recurrenceID), summary, start, startOfDay, endOfDay)
+			continue
+		}
+		if !isUsableEvent(summary, status, startProperty) {
+			continue
+		}
+		start, err := parseICalTime(startProperty, now.Location())
+		if err != nil {
+			return nil, err
+		}
+
+		recurring := len(component.properties["RRULE"]) > 0 || len(component.properties["RDATE"]) > 0
+		if !recurring {
+			events = appendEventForDay(events, seen, uid, summary, start, startOfDay, endOfDay)
+			continue
+		}
+
+		occurrences := []time.Time{start}
+		if rules := component.properties["RRULE"]; len(rules) > 0 {
+			option, err := rrule.StrToROption(rules[0].Value)
+			if err != nil {
+				return nil, fmt.Errorf("parse RRULE for %q: %w", uid, err)
+			}
+			option.Dtstart = start
+			rule, err := rrule.NewRRule(*option)
+			if err != nil {
+				return nil, fmt.Errorf("build RRULE for %q: %w", uid, err)
+			}
+			occurrences = rule.Between(startOfDay, endOfDay, true)
+		}
+		rdates, err := parseICalTimes(component.properties["RDATE"], now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("parse RDATE for %q: %w", uid, err)
+		}
+		occurrences = append(occurrences, rdates...)
+		exdates, err := parseICalTimes(component.properties["EXDATE"], now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("parse EXDATE for %q: %w", uid, err)
+		}
+		excluded := make(map[string]struct{}, len(exdates))
+		for _, date := range exdates {
+			excluded[recurrenceKey(date)] = struct{}{}
+		}
+		for _, occurrence := range occurrences {
+			key := recurrenceKey(occurrence)
+			if _, exists := excluded[key]; exists {
+				continue
+			}
+			if _, replaced := overrides[uid+"\x00"+key]; replaced {
+				continue
+			}
+			events = appendEventForDay(events, seen, recurringUID(uid, occurrence), summary, occurrence, startOfDay, endOfDay)
+		}
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].DueDate != events[j].DueDate {
+			return events[i].DueDate < events[j].DueDate
+		}
+		if events[i].DueTime != events[j].DueTime {
+			return events[i].DueTime < events[j].DueTime
+		}
+		return events[i].UID < events[j].UID
+	})
 	return events, nil
 }
