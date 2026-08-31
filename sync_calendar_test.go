@@ -232,3 +232,64 @@ func TestInvalidWebCalProxy(t *testing.T) {
 		t.Fatal("expected invalid proxy error")
 	}
 }
+
+func TestDeleteExpiredCompletedTodos(t *testing.T) {
+	var mu sync.Mutex
+	var deleted []string
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.Local)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.Query().Get("status") != "1" || r.URL.Query().Get("deviceId") != "device-1" {
+				http.Error(w, "unexpected completed todo query", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(apiResponse{Code: 0, Data: mustJSON(t, []Todo{
+				{ID: json.RawMessage(`1`), Title: calendarPrefix + " old", Status: 1, UpdateDate: now.Add(-25 * time.Hour).Unix()},
+				{ID: json.RawMessage(`2`), Title: calendarPrefix + " recent", Status: 1, UpdateDate: now.Add(-23 * time.Hour).Unix()},
+				{ID: json.RawMessage(`3`), Title: "manual old", Status: 1, UpdateDate: now.Add(-48 * time.Hour).Unix()},
+				{ID: json.RawMessage(`4`), Title: calendarPrefix + " active", Status: 0, UpdateDate: now.Add(-48 * time.Hour).Unix()},
+			})})
+		case http.MethodDelete:
+			mu.Lock()
+			deleted = append(deleted, r.URL.Path)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(apiResponse{Code: 0})
+		}
+	}))
+	defer server.Close()
+
+	syncer, err := newCalendarSyncer(Config{
+		ZectrixAPIBase: server.URL, ZectrixDeviceID: "device-1",
+		CompletedRetentionHours: 24, RequestTimeout: 2 * time.Second,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncer.now = func() time.Time { return now }
+	syncer.sleep = func(time.Duration) {}
+	if err := syncer.getCompletedTodos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncer.deleteExpiredCompletedTodos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]string(nil), deleted...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "/todos/1" {
+		t.Fatalf("deleted paths = %#v, want [/todos/1]", got)
+	}
+}
+
+func mustJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}

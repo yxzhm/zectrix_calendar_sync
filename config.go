@@ -12,12 +12,13 @@ import (
 const registryConfigPath = `Software\ZectrixCalendarSync`
 
 const (
-	valueZectrixAPIBase    = "ZECTRIX_API_BASE"
-	valueZectrixAPIKey     = "ZECTRIX_API_KEY"
-	valueZectrixDeviceID   = "ZECTRIX_DEVICE_ID"
-	valueExpireHours       = "EXPIRE_HOURS"
-	valueGoogleCalendarURL = "GOOGLE_CALENDAR_URL"
-	valueWebCalProxy       = "WEBCAL_PROXY"
+	valueZectrixAPIBase          = "ZECTRIX_API_BASE"
+	valueZectrixAPIKey           = "ZECTRIX_API_KEY"
+	valueZectrixDeviceID         = "ZECTRIX_DEVICE_ID"
+	valueExpireHours             = "EXPIRE_HOURS"
+	valueCompletedRetentionHours = "COMPLETED_RETENTION_HOURS"
+	valueGoogleCalendarURL       = "GOOGLE_CALENDAR_URL"
+	valueWebCalProxy             = "WEBCAL_PROXY"
 )
 
 var defaultStringValues = map[string]string{
@@ -28,16 +29,26 @@ var defaultStringValues = map[string]string{
 	valueWebCalProxy:       "",
 }
 
-const defaultExpireHours uint32 = 24
+const (
+	defaultExpireHours             uint32 = 12
+	defaultCompletedRetentionHours uint32 = 24
+	maxDurationHours                      = uint64((1<<63 - 1) / time.Hour)
+)
+
+var defaultIntegerValues = map[string]uint32{
+	valueExpireHours:             defaultExpireHours,
+	valueCompletedRetentionHours: defaultCompletedRetentionHours,
+}
 
 type Config struct {
-	ZectrixAPIBase    string
-	ZectrixAPIKey     string
-	ZectrixDeviceID   string
-	ExpireHours       int
-	GoogleCalendarURL string
-	WebCalProxy       string
-	RequestTimeout    time.Duration
+	ZectrixAPIBase          string
+	ZectrixAPIKey           string
+	ZectrixDeviceID         string
+	ExpireHours             int
+	CompletedRetentionHours int
+	GoogleCalendarURL       string
+	WebCalProxy             string
+	RequestTimeout          time.Duration
 }
 
 type configRegistryKey interface {
@@ -74,28 +85,33 @@ func loadConfigFromRegistry(key configRegistryKey) (Config, error) {
 		}
 	}
 
-	expireHours, _, err := key.GetIntegerValue(valueExpireHours)
-	switch {
-	case err == nil:
-	case errors.Is(err, registry.ErrNotExist):
-		if err := key.SetDWordValue(valueExpireHours, defaultExpireHours); err != nil {
-			return Config{}, fmt.Errorf("create registry value %s: %w", valueExpireHours, err)
+	integerValues := make(map[string]uint64, len(defaultIntegerValues))
+	for name, fallback := range defaultIntegerValues {
+		value, _, err := key.GetIntegerValue(name)
+		switch {
+		case err == nil:
+			integerValues[name] = value
+		case errors.Is(err, registry.ErrNotExist):
+			if err := key.SetDWordValue(name, fallback); err != nil {
+				return Config{}, fmt.Errorf("create registry value %s: %w", name, err)
+			}
+			integerValues[name] = uint64(fallback)
+		default:
+			return Config{}, fmt.Errorf("read registry value %s: %w", name, err)
 		}
-		expireHours = uint64(defaultExpireHours)
-	default:
-		return Config{}, fmt.Errorf("read registry value %s: %w", valueExpireHours, err)
-	}
-	if expireHours > uint64(^uint(0)>>1) {
-		return Config{}, fmt.Errorf("registry value %s is too large", valueExpireHours)
+		if integerValues[name] > maxDurationHours {
+			return Config{}, fmt.Errorf("registry value %s is too large", name)
+		}
 	}
 
 	return Config{
-		ZectrixAPIBase:    strings.TrimRight(values[valueZectrixAPIBase], "/"),
-		ZectrixAPIKey:     values[valueZectrixAPIKey],
-		ZectrixDeviceID:   values[valueZectrixDeviceID],
-		ExpireHours:       int(expireHours),
-		GoogleCalendarURL: strings.TrimSpace(values[valueGoogleCalendarURL]),
-		WebCalProxy:       strings.TrimSpace(values[valueWebCalProxy]),
-		RequestTimeout:    10 * time.Second,
+		ZectrixAPIBase:          strings.TrimRight(values[valueZectrixAPIBase], "/"),
+		ZectrixAPIKey:           values[valueZectrixAPIKey],
+		ZectrixDeviceID:         values[valueZectrixDeviceID],
+		ExpireHours:             int(integerValues[valueExpireHours]),
+		CompletedRetentionHours: int(integerValues[valueCompletedRetentionHours]),
+		GoogleCalendarURL:       strings.TrimSpace(values[valueGoogleCalendarURL]),
+		WebCalProxy:             strings.TrimSpace(values[valueWebCalProxy]),
+		RequestTimeout:          10 * time.Second,
 	}, nil
 }

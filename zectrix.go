@@ -23,6 +23,7 @@ type Todo struct {
 	DueDate     string          `json:"dueDate"`
 	DueTime     string          `json:"dueTime"`
 	Status      int             `json:"status"`
+	UpdateDate  int64           `json:"updateDate"`
 }
 
 func (t Todo) idString() string { return strings.Trim(string(t.ID), `"`) }
@@ -99,6 +100,25 @@ func (s *CalendarSyncer) getExistingTodos(ctx context.Context) error {
 	})
 }
 
+func (s *CalendarSyncer) getCompletedTodos(ctx context.Context) error {
+	return s.retry("get completed todos", func() error {
+		query := url.Values{"status": {"1"}, "deviceId": {s.cfg.ZectrixDeviceID}}
+		result, err := s.zectrixRequest(ctx, http.MethodGet, "/todos?"+query.Encode(), nil)
+		if err != nil {
+			return err
+		}
+		var todos []Todo
+		if len(result.Data) > 0 && string(result.Data) != "null" {
+			if err := json.Unmarshal(result.Data, &todos); err != nil {
+				return fmt.Errorf("decode completed todos: %w", err)
+			}
+		}
+		s.completedTodos = todos
+		log.Printf("found %d completed todos", len(todos))
+		return nil
+	})
+}
+
 func (s *CalendarSyncer) activeCalendarTodos() []Todo {
 	result := make([]Todo, 0)
 	for _, todo := range s.existingTodos {
@@ -122,14 +142,13 @@ func (s *CalendarSyncer) completeExpiredTodos(ctx context.Context) error {
 	var failures []error
 	count := 0
 	for _, todo := range s.activeCalendarTodos() {
-		if !s.isExpired(todo) {
-			continue
+		if s.isExpired(todo) {
+			if err := s.completeTodo(ctx, todo); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			count++
 		}
-		if err := s.completeTodo(ctx, todo); err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		count++
 	}
 	log.Printf("completed %d expired calendar todos", count)
 	return errors.Join(failures...)
@@ -144,6 +163,35 @@ func (s *CalendarSyncer) completeTodo(ctx context.Context, todo Todo) error {
 		_, err := s.zectrixRequest(ctx, http.MethodPut, "/todos/"+url.PathEscape(todo.idString())+"/complete", nil)
 		return err
 	})
+}
+
+func (s *CalendarSyncer) deleteExpiredCompletedTodos(ctx context.Context) error {
+	if err := s.getCompletedTodos(ctx); err != nil {
+		log.Printf("could not get completed todos for cleanup: %v", err)
+	}
+
+	retention := time.Duration(s.cfg.CompletedRetentionHours) * time.Hour
+	var failures []error
+	count := 0
+	for _, todo := range s.completedTodos {
+		if todo.Status != 1 || !strings.HasPrefix(todo.Title, calendarPrefix) {
+			continue
+		}
+		if todo.UpdateDate <= 0 {
+			log.Printf("cannot determine completion time for todo id=%s: invalid updateDate=%d", todo.idString(), todo.UpdateDate)
+			continue
+		}
+		if s.now().Sub(time.Unix(todo.UpdateDate, 0)) < retention {
+			continue
+		}
+		if err := s.deleteTodo(ctx, todo); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		count++
+	}
+	log.Printf("deleted %d completed calendar todos older than %d hours", count, s.cfg.CompletedRetentionHours)
+	return errors.Join(failures...)
 }
 
 func (s *CalendarSyncer) deleteTodo(ctx context.Context, todo Todo) error {

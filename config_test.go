@@ -62,8 +62,13 @@ func TestLoadConfigFromRegistryCreatesDefaults(t *testing.T) {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
-	if got := key.integers[valueExpireHours]; got != uint64(defaultExpireHours) {
-		t.Errorf("%s = %d, want %d", valueExpireHours, got, defaultExpireHours)
+	if len(key.integers) != len(defaultIntegerValues) {
+		t.Fatalf("created %d integer values, want %d", len(key.integers), len(defaultIntegerValues))
+	}
+	for name, want := range defaultIntegerValues {
+		if got := key.integers[name]; got != uint64(want) {
+			t.Errorf("%s = %d, want %d", name, got, want)
+		}
 	}
 	if cfg.ZectrixAPIBase != defaultStringValues[valueZectrixAPIBase] || cfg.ExpireHours != int(defaultExpireHours) {
 		t.Fatalf("unexpected defaults: %#v", cfg)
@@ -82,7 +87,11 @@ func TestLoadConfigFromRegistryUsesExistingValues(t *testing.T) {
 	key.strings[valueZectrixAPIKey] = "secret"
 	key.strings[valueGoogleCalendarURL] = "  webcal://calendar.google.com/calendar/ical/example/basic.ics  "
 	key.strings[valueWebCalProxy] = "  http://proxy.test:8080  "
+	for name, value := range defaultIntegerValues {
+		key.integers[name] = uint64(value)
+	}
 	key.integers[valueExpireHours] = 24
+	key.integers[valueCompletedRetentionHours] = 72
 
 	cfg, err := loadConfigFromRegistry(key)
 	if err != nil {
@@ -94,6 +103,9 @@ func TestLoadConfigFromRegistryUsesExistingValues(t *testing.T) {
 	}
 	if cfg.GoogleCalendarURL != "webcal://calendar.google.com/calendar/ical/example/basic.ics" || cfg.WebCalProxy != "http://proxy.test:8080" || cfg.ExpireHours != 24 {
 		t.Fatalf("unexpected proxy/expiry config: %#v", cfg)
+	}
+	if cfg.CompletedRetentionHours != 72 {
+		t.Fatalf("CompletedRetentionHours = %d, want 72", cfg.CompletedRetentionHours)
 	}
 }
 

@@ -18,6 +18,7 @@ type CalendarSyncer struct {
 	sleep          func(time.Duration)
 	maxRetries     int
 	existingTodos  []Todo
+	completedTodos []Todo
 	uidMap         map[string]Todo
 }
 
@@ -63,6 +64,16 @@ func (s *CalendarSyncer) retry(operation string, fn func() error) error {
 func (s *CalendarSyncer) run(ctx context.Context) error {
 	log.Printf("starting calendar sync at %s", s.now().Format(time.RFC3339))
 
+	if err := s.getExistingTodos(ctx); err != nil {
+		return err
+	}
+	if err := s.completeExpiredTodos(ctx); err != nil {
+		log.Printf("some expired todos could not be completed: %v", err)
+	}
+	if err := s.deleteExpiredCompletedTodos(ctx); err != nil {
+		log.Printf("some completed todos could not be deleted: %v", err)
+	}
+
 	events, err := s.fetchGoogleCalendarEvents(ctx)
 	if err != nil {
 		return err
@@ -73,13 +84,6 @@ func (s *CalendarSyncer) run(ctx context.Context) error {
 	if len(events) == 0 {
 		log.Print("no remaining events returned; skipping event synchronization")
 		return nil
-	}
-
-	if err := s.getExistingTodos(ctx); err != nil {
-		return err
-	}
-	if err := s.completeExpiredTodos(ctx); err != nil {
-		log.Printf("some expired todos could not be completed: %v", err)
 	}
 
 	return s.syncEvents(ctx, events)
