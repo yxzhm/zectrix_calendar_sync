@@ -248,7 +248,7 @@ func appendEventForDay(events []Event, seen map[string]struct{}, uid, summary st
 
 func parseICalendar(data string, now time.Time) ([]Event, error) {
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	endOfDay := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	endOfDay := time.Date(now.Year(), now.Month(), now.Day()+2, 0, 0, 0, 0, now.Location())
 	components := parseICalEvents(data)
 
 	// Changed and cancelled instances are separate VEVENTs. Index them first so
