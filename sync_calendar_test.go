@@ -236,20 +236,22 @@ func TestInvalidWebCalProxy(t *testing.T) {
 func TestDeleteExpiredCompletedTodos(t *testing.T) {
 	var mu sync.Mutex
 	var deleted []string
+	var getRequests atomic.Int32
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.Local)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			if r.URL.Query().Get("status") != "1" || r.URL.Query().Get("deviceId") != "device-1" {
-				http.Error(w, "unexpected completed todo query", http.StatusBadRequest)
+			getRequests.Add(1)
+			if r.URL.Query().Has("status") || r.URL.Query().Get("deviceId") != "device-1" {
+				http.Error(w, "unexpected todo query", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(apiResponse{Code: 0, Data: mustJSON(t, []Todo{
-				{ID: json.RawMessage(`1`), Title: calendarPrefix + " old", Status: 1, UpdateDate: now.Add(-25 * time.Hour).Unix()},
-				{ID: json.RawMessage(`2`), Title: calendarPrefix + " recent", Status: 1, UpdateDate: now.Add(-23 * time.Hour).Unix()},
-				{ID: json.RawMessage(`3`), Title: "manual old", Status: 1, UpdateDate: now.Add(-48 * time.Hour).Unix()},
-				{ID: json.RawMessage(`4`), Title: calendarPrefix + " active", Status: 0, UpdateDate: now.Add(-48 * time.Hour).Unix()},
+				{ID: json.RawMessage(`1`), Title: calendarPrefix + " old", DueDate: "2026-08-30", DueTime: "11:00", Status: 1},
+				{ID: json.RawMessage(`2`), Title: calendarPrefix + " recent", DueDate: "2026-08-30", DueTime: "13:00", Status: 1},
+				{ID: json.RawMessage(`3`), Title: "manual old", DueDate: "2026-08-29", DueTime: "12:00", Status: 1},
+				{ID: json.RawMessage(`4`), Title: calendarPrefix + " active", DueDate: "2026-08-29", DueTime: "12:00", Status: 0},
 			})})
 		case http.MethodDelete:
 			mu.Lock()
@@ -270,8 +272,11 @@ func TestDeleteExpiredCompletedTodos(t *testing.T) {
 	}
 	syncer.now = func() time.Time { return now }
 	syncer.sleep = func(time.Duration) {}
-	if err := syncer.getCompletedTodos(context.Background()); err != nil {
+	if err := syncer.getExistingTodos(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if len(syncer.existingTodos) != 1 || len(syncer.completedTodos) != 3 {
+		t.Fatalf("active todos=%d completed todos=%d, want 1 and 3", len(syncer.existingTodos), len(syncer.completedTodos))
 	}
 
 	if err := syncer.deleteExpiredCompletedTodos(context.Background()); err != nil {
@@ -282,6 +287,9 @@ func TestDeleteExpiredCompletedTodos(t *testing.T) {
 	mu.Unlock()
 	if len(got) != 1 || got[0] != "/todos/1" {
 		t.Fatalf("deleted paths = %#v, want [/todos/1]", got)
+	}
+	if getRequests.Load() != 1 {
+		t.Fatalf("GET requests = %d, want 1", getRequests.Load())
 	}
 }
 

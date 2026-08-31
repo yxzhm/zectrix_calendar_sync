@@ -23,7 +23,6 @@ type Todo struct {
 	DueDate     string          `json:"dueDate"`
 	DueTime     string          `json:"dueTime"`
 	Status      int             `json:"status"`
-	UpdateDate  int64           `json:"updateDate"`
 }
 
 func (t Todo) idString() string { return strings.Trim(string(t.ID), `"`) }
@@ -77,7 +76,7 @@ func (s *CalendarSyncer) zectrixRequest(ctx context.Context, method, path string
 
 func (s *CalendarSyncer) getExistingTodos(ctx context.Context) error {
 	return s.retry("get todos", func() error {
-		query := url.Values{"status": {"0"}, "deviceId": {s.cfg.ZectrixDeviceID}}
+		query := url.Values{"deviceId": {s.cfg.ZectrixDeviceID}}
 		result, err := s.zectrixRequest(ctx, http.MethodGet, "/todos?"+query.Encode(), nil)
 		if err != nil {
 			return err
@@ -88,33 +87,21 @@ func (s *CalendarSyncer) getExistingTodos(ctx context.Context) error {
 				return fmt.Errorf("decode todos: %w", err)
 			}
 		}
-		s.existingTodos = todos
+		s.existingTodos = make([]Todo, 0, len(todos))
+		s.completedTodos = make([]Todo, 0, len(todos))
 		s.uidMap = make(map[string]Todo, len(todos))
 		for _, todo := range todos {
-			if uid := extractUID(todo.Description); uid != "" {
-				s.uidMap[uid] = todo
+			switch todo.Status {
+			case 0:
+				s.existingTodos = append(s.existingTodos, todo)
+				if uid := extractUID(todo.Description); uid != "" {
+					s.uidMap[uid] = todo
+				}
+			case 1:
+				s.completedTodos = append(s.completedTodos, todo)
 			}
 		}
-		log.Printf("found %d existing todos", len(todos))
-		return nil
-	})
-}
-
-func (s *CalendarSyncer) getCompletedTodos(ctx context.Context) error {
-	return s.retry("get completed todos", func() error {
-		query := url.Values{"status": {"1"}, "deviceId": {s.cfg.ZectrixDeviceID}}
-		result, err := s.zectrixRequest(ctx, http.MethodGet, "/todos?"+query.Encode(), nil)
-		if err != nil {
-			return err
-		}
-		var todos []Todo
-		if len(result.Data) > 0 && string(result.Data) != "null" {
-			if err := json.Unmarshal(result.Data, &todos); err != nil {
-				return fmt.Errorf("decode completed todos: %w", err)
-			}
-		}
-		s.completedTodos = todos
-		log.Printf("found %d completed todos", len(todos))
+		log.Printf("found %d active and %d completed todos", len(s.existingTodos), len(s.completedTodos))
 		return nil
 	})
 }
@@ -130,12 +117,16 @@ func (s *CalendarSyncer) activeCalendarTodos() []Todo {
 }
 
 func (s *CalendarSyncer) isExpired(todo Todo) bool {
+	return s.isExpiredAfter(todo, s.cfg.ExpireHours)
+}
+
+func (s *CalendarSyncer) isExpiredAfter(todo Todo, hours int) bool {
 	due, err := time.ParseInLocation("2006-01-02 15:04", todo.DueDate+" "+todo.DueTime, s.now().Location())
 	if err != nil {
 		log.Printf("cannot parse due time %q %q: %v", todo.DueDate, todo.DueTime, err)
 		return false
 	}
-	return s.now().Sub(due) >= time.Duration(s.cfg.ExpireHours)*time.Hour
+	return s.now().Sub(due) >= time.Duration(hours)*time.Hour
 }
 
 func (s *CalendarSyncer) completeExpiredTodos(ctx context.Context) error {
@@ -166,31 +157,21 @@ func (s *CalendarSyncer) completeTodo(ctx context.Context, todo Todo) error {
 }
 
 func (s *CalendarSyncer) deleteExpiredCompletedTodos(ctx context.Context) error {
-	if err := s.getCompletedTodos(ctx); err != nil {
-		log.Printf("could not get completed todos for cleanup: %v", err)
-	}
-
-	retention := time.Duration(s.cfg.CompletedRetentionHours) * time.Hour
 	var failures []error
 	count := 0
 	for _, todo := range s.completedTodos {
 		if todo.Status != 1 || !strings.HasPrefix(todo.Title, calendarPrefix) {
 			continue
 		}
-		if todo.UpdateDate <= 0 {
-			log.Printf("cannot determine completion time for todo id=%s: invalid updateDate=%d", todo.idString(), todo.UpdateDate)
-			continue
+		if s.isExpiredAfter(todo, s.cfg.CompletedRetentionHours) {
+			if err := s.deleteTodo(ctx, todo); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			count++
 		}
-		if s.now().Sub(time.Unix(todo.UpdateDate, 0)) < retention {
-			continue
-		}
-		if err := s.deleteTodo(ctx, todo); err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		count++
 	}
-	log.Printf("deleted %d completed calendar todos older than %d hours", count, s.cfg.CompletedRetentionHours)
+	log.Printf("deleted %d completed calendar todos whose due time was at least %d hours ago", count, s.cfg.CompletedRetentionHours)
 	return errors.Join(failures...)
 }
 
